@@ -12,11 +12,16 @@ const api = axios.create({
 
 api.interceptors.request.use(
   (config) => {
-    const password = localStorage.getItem("auth_password");
-    const username = localStorage.getItem("auth_user") || "admin";
-    if (password) {
-      const token = btoa(`${username}:${password}`);
-      config.headers["Authorization"] = `Basic ${token}`;
+    const plexToken = localStorage.getItem("plex_token");
+    if (plexToken) {
+      config.headers["X-Auth-Token"] = plexToken;
+    } else {
+      const password = localStorage.getItem("auth_password");
+      const username = localStorage.getItem("auth_user") || "admin";
+      if (password) {
+        const token = btoa(`${username}:${password}`);
+        config.headers["Authorization"] = `Basic ${token}`;
+      }
     }
     return config;
   },
@@ -191,6 +196,28 @@ export const verifyCredentials = async (password, username = "admin") => {
     }
     throw error;
   }
+};
+
+export const verifyPlexToken = async (plexToken) => {
+  try {
+    await api.get("/settings", {
+      headers: { "X-Auth-Token": plexToken },
+    });
+    return true;
+  } catch (error) {
+    if (error.response?.status === 401) return false;
+    throw error;
+  }
+};
+
+export const requestPlexPin = async () => {
+  const response = await api.post("/auth/plex/pin");
+  return response.data;
+};
+
+export const checkPlexPin = async (pinId) => {
+  const response = await api.get(`/auth/plex/pin/${pinId}`);
+  return response.data;
 };
 
 export const getAppSettings = async () => {

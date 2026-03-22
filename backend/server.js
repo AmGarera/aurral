@@ -10,6 +10,7 @@ import { Low } from "lowdb";
 import { JSONFile } from "lowdb/node";
 import fs from "fs";
 import path from "path";
+import { randomUUID } from "crypto";
 
 dotenv.config();
 
@@ -55,6 +56,8 @@ const defaultData = {
     searchForMissingAlbums: false,
     albumFolders: true,
   },
+  plexClientId: null,
+  plexSessions: [],
 };
 
 const DATA_DIR = "data";
@@ -67,6 +70,16 @@ if (!fs.existsSync(DATA_DIR)) {
 const adapter = new JSONFile(DB_PATH);
 const db = new Low(adapter, defaultData);
 await db.read();
+
+// Ensure plexClientId is initialized
+if (!db.data.plexClientId) {
+  db.data.plexClientId = randomUUID();
+  await db.write();
+}
+if (!db.data.plexSessions) {
+  db.data.plexSessions = [];
+  await db.write();
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -94,13 +107,21 @@ app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
-if (process.env.AUTH_PASSWORD) {
+const PLEX_AUTH_ENABLED = process.env.PLEX_AUTH === "true";
+const PLEX_SERVER_ID = process.env.PLEX_SERVER_ID || "";
+const PLEX_API = "https://plex.tv/api/v2";
+const PLEX_APP_PRODUCT = "Aurral";
+
+const basicAuthRequired = !!process.env.AUTH_PASSWORD;
+const authRequired = basicAuthRequired || PLEX_AUTH_ENABLED;
+
+let basicAuthMiddleware = null;
+if (basicAuthRequired) {
   const adminUser = process.env.AUTH_USER || "admin";
   const validPasswords = process.env.AUTH_PASSWORD.split(",")
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
-
-  const auth = basicAuth({
+  basicAuthMiddleware = basicAuth({
     authorizer: (username, password) => {
       const userMatches = basicAuth.safeCompare(username, adminUser);
       const passwordMatches = validPasswords.some((p) =>
@@ -110,10 +131,39 @@ if (process.env.AUTH_PASSWORD) {
     },
     challenge: false,
   });
+}
 
-  app.use((req, res, next) => {
-    if (req.path === "/api/health") return next();
-    return auth(req, res, next);
+const isPublicPath = (reqPath) => {
+  return (
+    reqPath === "/api/health" ||
+    reqPath === "/api/auth/plex/pin" ||
+    reqPath.startsWith("/api/auth/plex/pin/")
+  );
+};
+
+if (authRequired) {
+  app.use(async (req, res, next) => {
+    if (isPublicPath(req.path)) return next();
+
+    // Check Plex session token first
+    if (PLEX_AUTH_ENABLED) {
+      const token = req.headers["x-auth-token"];
+      if (token) {
+        await db.read();
+        const session = (db.data.plexSessions || []).find(
+          (s) => s.token === token,
+        );
+        if (session) return next();
+      }
+    }
+
+    // Fall back to basic auth if configured
+    if (basicAuthMiddleware) {
+      return basicAuthMiddleware(req, res, next);
+    }
+
+    // Plex auth required but no valid token
+    res.status(401).json({ error: "Authentication required" });
   });
 }
 
@@ -122,6 +172,99 @@ const limiter = rateLimit({
   max: 5000,
 });
 app.use("/api/", limiter);
+
+// Plex PIN-based authentication endpoints
+app.post("/api/auth/plex/pin", async (req, res) => {
+  if (!PLEX_AUTH_ENABLED) {
+    return res.status(404).json({ error: "Plex auth is not enabled" });
+  }
+  try {
+    await db.read();
+    const clientId = db.data.plexClientId;
+    const response = await axios.post(
+      `${PLEX_API}/pins`,
+      new URLSearchParams({ strong: "true" }).toString(),
+      {
+        headers: {
+          "X-Plex-Client-Identifier": clientId,
+          "X-Plex-Product": PLEX_APP_PRODUCT,
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+      },
+    );
+    const { id, code } = response.data;
+    const authUrl =
+      `https://app.plex.tv/auth#?clientID=${encodeURIComponent(clientId)}` +
+      `&code=${encodeURIComponent(code)}` +
+      `&context%5Bdevice%5D%5Bproduct%5D=${encodeURIComponent(PLEX_APP_PRODUCT)}`;
+    res.json({ id, code, authUrl });
+  } catch (error) {
+    console.error("Plex PIN request failed:", error.message);
+    res.status(500).json({ error: "Failed to create Plex PIN" });
+  }
+});
+
+app.get("/api/auth/plex/pin/:id", async (req, res) => {
+  if (!PLEX_AUTH_ENABLED) {
+    return res.status(404).json({ error: "Plex auth is not enabled" });
+  }
+  try {
+    await db.read();
+    const clientId = db.data.plexClientId;
+    const { id } = req.params;
+    const response = await axios.get(`${PLEX_API}/pins/${id}`, {
+      headers: {
+        "X-Plex-Client-Identifier": clientId,
+        "X-Plex-Product": PLEX_APP_PRODUCT,
+        Accept: "application/json",
+      },
+    });
+    const { authToken } = response.data;
+    if (!authToken) {
+      return res.json({ status: "pending" });
+    }
+    // Optionally verify the user has access to the configured Plex server
+    if (PLEX_SERVER_ID) {
+      try {
+        const resourcesResponse = await axios.get(
+          `${PLEX_API}/resources`,
+          {
+            headers: {
+              "X-Plex-Token": authToken,
+              "X-Plex-Client-Identifier": clientId,
+              Accept: "application/json",
+            },
+            params: { includeHttps: 1, includeRelay: 1 },
+          },
+        );
+        const servers = resourcesResponse.data;
+        const hasAccess = Array.isArray(servers) &&
+          servers.some((s) => s.clientIdentifier === PLEX_SERVER_ID);
+        if (!hasAccess) {
+          return res
+            .status(403)
+            .json({ error: "You do not have access to the configured Plex server" });
+        }
+      } catch (err) {
+        console.error("Plex server verification failed:", err.message);
+        return res.status(500).json({ error: "Failed to verify Plex server access" });
+      }
+    }
+    // Create a local session token
+    const sessionToken = randomUUID();
+    db.data.plexSessions.push({
+      token: sessionToken,
+      plexToken: authToken,
+      createdAt: new Date().toISOString(),
+    });
+    await db.write();
+    res.json({ status: "success", token: sessionToken });
+  } catch (error) {
+    console.error("Plex PIN check failed:", error.message);
+    res.status(500).json({ error: "Failed to check Plex PIN" });
+  }
+});
 
 app.get("/api/settings", (req, res) => {
   res.json(db.data.settings || defaultData.settings);
@@ -329,8 +472,9 @@ app.get("/api/health", async (req, res) => {
         ? Object.keys(db.data.images).length
         : 0,
     },
-    authRequired: !!process.env.AUTH_PASSWORD,
+    authRequired: basicAuthRequired || PLEX_AUTH_ENABLED,
     authUser: process.env.AUTH_USER || "admin",
+    plexAuthEnabled: PLEX_AUTH_ENABLED,
     timestamp: new Date().toISOString(),
   });
 });
